@@ -1,0 +1,22 @@
+name: 功能建议
+description: 提出迁移流程或使用体验的改进建议。
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 描述实际使用场景和目前遇到的麻烦。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 希望怎样改进
+      description: 描述希望工具提供的操作或结果。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 其他想法或替代方案

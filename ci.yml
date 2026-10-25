@@ -1,0 +1,45 @@
+name: Windows build and tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test on Windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build and run regression tests
+        run: .\build.ps1 -Test
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: CraftBridge-Windows
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: CraftBridge-TestResults
+          path: |
+            build/test-results.json
+            build/ui-test-results.json
+          if-no-files-found: warn
+          retention-days: 14
