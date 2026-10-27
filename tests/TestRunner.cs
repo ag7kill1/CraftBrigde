@@ -9,7 +9,7 @@ namespace CraftBridge.Tests
     {
         public static int Main()
         {
-            int passed = 0, failed = 0;
+            int passed = 0, failed = 0, skipped = 0;
             List<object> results = new List<object>();
             Action<string, Action> run = (name, test) => {
                 try { test(); passed++; Console.WriteLine("PASS  " + name); results.Add(new { name = name, passed = true, error = "" }); }
@@ -18,10 +18,15 @@ namespace CraftBridge.Tests
             EngineTests.Run(run);
             DiscoveryTests.Run(run);
             CoreAuditTests.Run(run);
+            CrossVolumeTests.Run(run, (name, reason) => {
+                skipped++;
+                Console.WriteLine("SKIP  " + name + ": " + reason);
+                results.Add(new { name = name, passed = false, skipped = true, error = reason });
+            });
             string build = Path.Combine(Environment.CurrentDirectory, "build");
             Directory.CreateDirectory(build);
-            File.WriteAllText(Path.Combine(build, "test-results.json"), new JavaScriptSerializer().Serialize(new { passed = passed, failed = failed, tests = results }));
-            Console.WriteLine("\n" + passed + " passed, " + failed + " failed.");
+            File.WriteAllText(Path.Combine(build, "test-results.json"), new JavaScriptSerializer().Serialize(new { passed = passed, failed = failed, skipped = skipped, tests = results }));
+            Console.WriteLine("\n" + passed + " passed, " + failed + " failed, " + skipped + " skipped.");
             return failed == 0 ? 0 : 1;
         }
     }

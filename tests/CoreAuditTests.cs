@@ -162,7 +162,8 @@ namespace CraftBridge.Tests
                 ImportPlan plan = PackageEngine.Preview(f.Zip, f.Game, "", null, true, None, null);
                 bool changed = false;
                 string backup = null;
-                Throws<IOException>(() => PackageEngine.Import(plan, cancellation.Token, p => {
+                IOException error = null;
+                try { PackageEngine.Import(plan, cancellation.Token, p => {
                     if (!changed && p.Message.StartsWith("正在导入", StringComparison.Ordinal) && p.Message.Contains("game/mods/b.jar"))
                     {
                         string backupRoot = Path.Combine(f.Game, ".craftbridge", "backups");
@@ -173,14 +174,22 @@ namespace CraftBridge.Tests
                         changed = true;
                         cancellation.Cancel();
                     }
-                }));
+                }); }
+                catch (IOException e) { error = e; }
+                Assert(error != null && error.InnerException is OperationCanceledException, "Changed-backup recovery lost its cancellation cause.");
                 Assert(changed, "The fixture did not reach a committed first replacement.");
                 Assert(File.ReadAllText(target) == "new a must stay recoverable", "Rollback installed unverified backup content.");
                 Assert(File.ReadAllText(backup) == "backup altered by another process", "Changed backup was consumed instead of retained for inspection.");
                 Assert(!File.Exists(Path.Combine(f.Game, "mods", "b.jar")), "The cancelled second file was installed.");
                 Assert(File.Exists(f.Zip), "Rollback removed the received ZIP.");
+                string journal = Directory.GetFiles(Path.Combine(f.Game, ".craftbridge", "backups"), "恢复记录.txt", SearchOption.AllDirectories).Single();
+                string recovery = File.ReadAllText(journal);
+                string[] statuses = recovery.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).Where(x => x.StartsWith("状态：", StringComparison.Ordinal)).ToArray();
+                Assert(statuses.Last() == "状态：需手动恢复", "Changed-backup recovery record has an incorrect final status.");
+                string final = recovery.Substring(recovery.LastIndexOf("状态：", StringComparison.Ordinal));
+                Assert(final.Contains("原因：" + error.InnerException.Message) && final.Contains(target) && final.Contains("替换前的备份已被更改"), "Changed-backup recovery entry lost its cause or problem path.");
                 string tasks = Path.Combine(f.Game, ".craftbridge", "tasks");
-                Assert(!Directory.Exists(tasks) || !Directory.EnumerateFiles(tasks, "*", SearchOption.AllDirectories).Any(), "Rollback left staged payloads behind.");
+                Assert(!Directory.Exists(tasks) || !Directory.EnumerateFileSystemEntries(tasks).Any(), "Rollback left a staged task directory behind.");
             }
         }
 

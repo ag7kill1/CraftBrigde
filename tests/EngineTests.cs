@@ -23,6 +23,7 @@ namespace CraftBridge.Tests
             run("Identical content is reused even when timestamps differ", IdenticalReuse);
             run("Default conflict handling keeps different local data", KeepLocal);
             run("Explicit replacement preserves old bytes in backup and keeps the received ZIP", BackupReplace);
+            run("Repeated replacements keep independent backup histories and accurate recovery mappings", BackupLifecycle);
             run("Import never deletes an extra target mod", ExtraTargetFiles);
             run("Different same-name worlds import to a separate complete world", WorldCopy);
             run("An identical complete world is reused", IdenticalWorld);
@@ -43,7 +44,9 @@ namespace CraftBridge.Tests
             run("Preview-to-import archive mutation is rejected before writes", ChangedArchive);
             run("Payload corruption is detected before any game data is replaced", CorruptPayload);
             run("Cancellation while staging removes temporary files without target writes", CancelStaging);
+            run("Cancellation while staging a world removes its whole task directory", CancelWorldStaging);
             run("Cancellation during commit rolls back already replaced data", CancelCommit);
+            run("An ordinary commit IOException restores replacements and removes only newly created directories", IOExceptionRollback);
             run("Cancellation records a completed rollback in the recovery journal", RollbackJournal);
             run("Failed temporary cleanup reports its exact path even on cancellation", CleanupFailure);
             run("Rollback preserves concurrent destination edits and retains the original backup", ConcurrentEditDuringRollback);
@@ -216,7 +219,39 @@ namespace CraftBridge.Tests
                 Assert(File.ReadAllText(target) == "new content" && result.Replaced == 1, "Replacement did not complete.");
                 string[] backups = Directory.GetFiles(result.BackupPath, "*.backup", SearchOption.AllDirectories);
                 Assert(backups.Length == 1 && File.ReadAllText(backups[0]) == "valuable old content", "Old bytes are missing from backup.");
+                AssertJournal(Path.Combine(result.BackupPath, "恢复记录.txt"), "导入成功", null, null);
                 Assert(FileSafety.Hash(f.Zip, None) == zipHash, "Import modified or deleted the received ZIP.");
+                AssertNoTemporary(f);
+            }
+        }
+
+        static void BackupLifecycle()
+        {
+            using (Fixture f = new Fixture())
+            {
+                f.PutSource("config/a.toml", "version one");
+                string target = f.PutTarget("config/a.toml", "original version");
+                f.Export(f.Scan());
+                string firstZipHash = FileSafety.Hash(f.Zip, None);
+                ImportResult first = PackageEngine.Import(f.Preview(true), None, null);
+                string firstBackup = Directory.GetFiles(first.BackupPath, "*.backup", SearchOption.AllDirectories).Single();
+                string secondZip = Path.Combine(f.Root, "second-pack.zip");
+                f.PutSource("config/a.toml", "version two");
+                ScanResult scan = f.Scan();
+                PackageEngine.Export(scan, scan.Files, secondZip, "fixture-test", false, None, null);
+                string secondZipHash = FileSafety.Hash(secondZip, None);
+                ImportResult second = PackageEngine.Import(PackageEngine.Preview(secondZip, f.Target, "", null, true, None, null), None, null);
+                string secondBackup = Directory.GetFiles(second.BackupPath, "*.backup", SearchOption.AllDirectories).Single();
+                Assert(first.BackupPath != second.BackupPath && firstBackup != secondBackup, "Two imports shared a backup task directory.");
+                Assert(File.ReadAllText(firstBackup) == "original version", "Second import changed the first backup.");
+                Assert(File.ReadAllText(secondBackup) == "version one" && File.ReadAllText(target) == "version two", "Backup history does not match the replacement sequence.");
+                foreach (var task in new[] { new { Root = first.BackupPath, Backup = firstBackup }, new { Root = second.BackupPath, Backup = secondBackup } })
+                {
+                    string journal = Path.Combine(task.Root, "恢复记录.txt");
+                    AssertJournal(journal, "导入成功", null, null);
+                    Assert(File.ReadAllText(journal).Contains("原位置：" + target + "\r\n备份：" + task.Backup), "Recovery journal maps the wrong destination or backup.");
+                }
+                Assert(FileSafety.Hash(f.Zip, None) == firstZipHash && FileSafety.Hash(secondZip, None) == secondZipHash, "Replacement history changed a received ZIP.");
                 AssertNoTemporary(f);
             }
         }
@@ -384,11 +419,13 @@ namespace CraftBridge.Tests
                 f.PutSource("mods/b.jar", "new b");
                 f.PutTarget("mods/a.jar", "original a");
                 f.Export(f.Scan());
-                Throws<OperationCanceledException>(() => PackageEngine.Import(f.Preview(true), cancel.Token, p => {
+                OperationCanceledException error = Capture<OperationCanceledException>(() => PackageEngine.Import(f.Preview(true), cancel.Token, p => {
                     if (p.Message.StartsWith("正在导入", StringComparison.Ordinal) && p.Message.Contains("game/mods/b.jar")) cancel.Cancel();
                 }));
                 string journal = Directory.GetFiles(Path.Combine(f.Target, ".craftbridge/backups"), "恢复记录.txt", SearchOption.AllDirectories).Single();
-                Assert(File.ReadAllText(journal).Contains("状态：已回退"), "Recovery record still says writing after a successful rollback.");
+                AssertJournal(journal, "已回退", error.Message, null);
+                Assert(!Directory.GetFiles(Path.GetDirectoryName(journal), "*.backup", SearchOption.AllDirectories).Any(), "Successful rollback left a consumed replacement backup behind.");
+                AssertNoTemporary(f);
             }
         }
 
@@ -442,14 +479,15 @@ namespace CraftBridge.Tests
                 f.Export(RuntimeScan(f));
                 ImportPlan plan = PackageEngine.Preview(f.Zip, f.Target, Path.Combine(f.Root, "target-runtime"), null, false, None, null);
                 bool edited = false;
-                Throws<IOException>(() => PackageEngine.Import(plan, cancel.Token, p => {
+                IOException error = Capture<IOException>(() => PackageEngine.Import(plan, cancel.Token, p => {
                     if (!edited && p.Message.StartsWith("正在导入  runtime/", StringComparison.Ordinal))
                     { edited = true; f.PutTarget("saves/Home/level.dat", "later game edit"); cancel.Cancel(); }
                 }));
                 Assert(edited && File.ReadAllText(Path.Combine(f.Target, "saves/Home/level.dat")) == "later game edit", "Concurrent edit was overwritten.");
                 Assert(File.ReadAllText(Path.Combine(f.Target, "saves/Home/region/r.0.0.mca")) == "incoming chunks", "Rollback removed unchanged chunks from the edited world.");
                 string journal = Directory.GetFiles(Path.Combine(f.Target, ".craftbridge/backups"), "恢复记录.txt", SearchOption.AllDirectories).Single();
-                Assert(File.ReadAllText(journal).Contains("状态：需手动恢复"), "Partial rollback was not recorded accurately.");
+                Assert(error.InnerException is OperationCanceledException, "Manual recovery lost its cancellation cause.");
+                AssertJournal(journal, "需手动恢复", error.InnerException.Message, Path.Combine(f.Target, "saves", "Home"));
                 AssertNoTemporary(f);
             }
         }
@@ -619,6 +657,68 @@ namespace CraftBridge.Tests
             }
         }
 
+        static void CancelWorldStaging()
+        {
+            using (Fixture f = new Fixture())
+            using (CancellationTokenSource cancel = new CancellationTokenSource())
+            {
+                f.PutSource("saves/Home/level.dat", "world metadata");
+                f.PutSource("saves/Home/region/r.0.0.mca", new string('r', 300000));
+                f.Export(f.Scan());
+                string zipHash = FileSafety.Hash(f.Zip, None);
+                string task = null;
+                bool sawLevel = false;
+                Throws<OperationCanceledException>(() => PackageEngine.Import(f.Preview(false), cancel.Token, p => {
+                    if (p.Message.StartsWith("校验并暂存", StringComparison.Ordinal) && p.Message.Contains("region/r.0.0.mca"))
+                    {
+                        task = Directory.GetDirectories(Path.Combine(f.Target, ".craftbridge", "tasks")).Single();
+                        sawLevel = Directory.GetFiles(task, "level.dat", SearchOption.AllDirectories).Length == 1;
+                        cancel.Cancel();
+                    }
+                }));
+                Assert(sawLevel && task != null, "World cancellation did not reach partially populated world staging.");
+                Assert(!Directory.Exists(task), "Cancelled world task directory survived, possibly with world files or empty folders.");
+                Assert(!Directory.Exists(Path.Combine(f.Target, "saves")), "Cancelled staging published a world.");
+                Assert(FileSafety.Hash(f.Zip, None) == zipHash, "World staging cancellation changed the received ZIP.");
+                AssertNoTemporary(f);
+            }
+        }
+
+        static void IOExceptionRollback()
+        {
+            using (Fixture f = new Fixture())
+            {
+                string existingEmpty = Path.Combine(f.Target, "config", "existing-empty");
+                Directory.CreateDirectory(existingEmpty);
+                f.PutSource("config/a-new/a.toml", "added data");
+                f.PutSource("config/b.toml", "replacement data");
+                f.PutSource("config/c-new/c.toml", new string('c', 300000));
+                string replacement = f.PutTarget("config/b.toml", "original b");
+                f.Export(f.Scan());
+                string zipHash = FileSafety.Hash(f.Zip, None);
+                ImportPlan plan = f.Preview(true);
+                bool injected = false;
+                string reason = "Injected ordinary IOException at game/config/c-new/c.toml";
+                IOException error = Capture<IOException>(() => PackageEngine.Import(plan, None, p => {
+                    if (p.Message.StartsWith("正在导入  ", StringComparison.Ordinal) && p.Message.Contains("game/config/c-new/c.toml"))
+                    {
+                        Assert(File.ReadAllText(Path.Combine(f.Target, "config/a-new/a.toml")) == "added data", "Added file was not committed before failure.");
+                        Assert(File.ReadAllText(replacement) == "replacement data", "Replacement was not committed before failure.");
+                        injected = true;
+                        throw new IOException(reason);
+                    }
+                }));
+                Assert(injected && error.Message == reason, "Fixture did not propagate the ordinary commit failure.");
+                Assert(!Directory.Exists(Path.Combine(f.Target, "config/a-new")) && !Directory.Exists(Path.Combine(f.Target, "config/c-new")), "Rollback left a newly created file directory.");
+                Assert(File.ReadAllText(replacement) == "original b", "Ordinary failure did not restore the replaced file.");
+                Assert(Directory.Exists(existingEmpty) && !Directory.EnumerateFileSystemEntries(existingEmpty).Any(), "Rollback deleted a pre-existing empty directory.");
+                string journal = Directory.GetFiles(Path.Combine(f.Target, ".craftbridge", "backups"), "恢复记录.txt", SearchOption.AllDirectories).Single();
+                AssertJournal(journal, "已回退", reason, "game/config/c-new/c.toml");
+                Assert(FileSafety.Hash(f.Zip, None) == zipHash, "Ordinary failure changed the received ZIP.");
+                AssertNoTemporary(f);
+            }
+        }
+
         static void ConcurrentEditDuringRollback()
         {
             using (Fixture f = new Fixture())
@@ -630,7 +730,7 @@ namespace CraftBridge.Tests
                 f.Export(f.Scan());
                 ImportPlan plan = f.Preview(true);
                 bool edited = false;
-                Throws<IOException>(() => PackageEngine.Import(plan, cancel.Token, p => {
+                IOException error = Capture<IOException>(() => PackageEngine.Import(plan, cancel.Token, p => {
                     if (!edited && p.Message.StartsWith("正在导入", StringComparison.Ordinal) && p.Message.Contains("game/mods/b.jar"))
                     {
                         edited = true;
@@ -643,6 +743,8 @@ namespace CraftBridge.Tests
                 string backupRoot = Path.Combine(f.Target, ".craftbridge", "backups");
                 string[] backups = Directory.GetFiles(backupRoot, "*.backup", SearchOption.AllDirectories);
                 Assert(backups.Any(x => File.ReadAllText(x) == "old a to retain in backup"), "Original content should remain available for manual recovery.");
+                Assert(error.InnerException is OperationCanceledException, "Concurrent-edit failure lost its original cause.");
+                AssertJournal(Directory.GetFiles(backupRoot, "恢复记录.txt", SearchOption.AllDirectories).Single(), "需手动恢复", error.InnerException.Message, target);
                 Assert(!File.Exists(Path.Combine(f.Target, "mods", "b.jar")), "Cancelled second file was installed.");
                 AssertNoTemporary(f);
             }
@@ -659,7 +761,7 @@ namespace CraftBridge.Tests
                 f.Export(f.Scan());
                 ImportPlan plan = f.Preview(true);
                 bool removed = false;
-                Throws<IOException>(() => PackageEngine.Import(plan, cancel.Token, p => {
+                IOException error = Capture<IOException>(() => PackageEngine.Import(plan, cancel.Token, p => {
                     if (!removed && p.Message.StartsWith("正在导入", StringComparison.Ordinal) && p.Message.Contains("game/mods/b.jar"))
                     {
                         string[] backups = Directory.GetFiles(Path.Combine(f.Target, ".craftbridge", "backups"), "*.backup", SearchOption.AllDirectories);
@@ -674,6 +776,10 @@ namespace CraftBridge.Tests
                 Assert(File.Exists(target) && File.ReadAllText(target) == "new a should remain recoverable", "Rollback deleted installed data after its original backup disappeared.");
                 Assert(!File.Exists(Path.Combine(f.Target, "mods", "b.jar")), "Cancelled second file was installed.");
                 Assert(File.Exists(f.Zip), "Manual recovery must preserve the received ZIP.");
+                Assert(error.InnerException is OperationCanceledException, "Missing-backup failure lost its original cause.");
+                string journal = Directory.GetFiles(Path.Combine(f.Target, ".craftbridge", "backups"), "恢复记录.txt", SearchOption.AllDirectories).Single();
+                AssertJournal(journal, "需手动恢复", error.InnerException.Message, target);
+                Assert(File.ReadAllText(journal).Contains("替换前的备份已被移走"), "Missing backup reason was not recorded.");
                 AssertNoTemporary(f);
             }
         }
@@ -895,11 +1001,31 @@ namespace CraftBridge.Tests
 
         static void AssertNoTemporary(Fixture f)
         {
+            string tasks = Path.Combine(f.Target, ".craftbridge", "tasks");
+            Assert(!Directory.Exists(tasks) || !Directory.EnumerateFileSystemEntries(tasks).Any(), "Temporary task directory remains (including world files or empty directories): " + tasks);
             string[] leftovers = Directory.GetFiles(f.Root, "*", SearchOption.AllDirectories).Where(x =>
                 Path.GetFileName(x).Contains(".partial-")
                 || (Path.GetFileName(x).StartsWith(".craftbridge-", StringComparison.Ordinal) && x.EndsWith(".tmp", StringComparison.Ordinal))
                 || (x.Contains(Path.DirectorySeparatorChar + "tasks" + Path.DirectorySeparatorChar) && x.EndsWith(".data", StringComparison.Ordinal))).ToArray();
             Assert(leftovers.Length == 0, "Temporary task files remain: " + String.Join(", ", leftovers));
+        }
+
+        static void AssertJournal(string path, string status, string reason, string problemPath)
+        {
+            string text = File.ReadAllText(path);
+            string[] statuses = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).Where(x => x.StartsWith("状态：", StringComparison.Ordinal)).ToArray();
+            Assert(statuses.Length > 0 && statuses.Last() == "状态：" + status, "Last recovery status is not " + status + ": " + path);
+            string final = text.Substring(text.LastIndexOf("状态：", StringComparison.Ordinal));
+            if (reason != null) Assert(final.Contains("原因：" + reason), "Final recovery entry lost its original failure reason.");
+            else Assert(!final.Contains("原因："), "Successful recovery entry unexpectedly contains a failure reason.");
+            if (problemPath != null) Assert(final.Contains(problemPath), "Final recovery entry lost its problem path.");
+        }
+
+        static T Capture<T>(Action action) where T : Exception
+        {
+            try { action(); }
+            catch (T error) { return error; }
+            throw new Exception("Expected " + typeof(T).Name + " was not thrown.");
         }
 
         static void Throws<T>(Action action) where T : Exception
