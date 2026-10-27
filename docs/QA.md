@@ -1,5 +1,30 @@
 # 验证记录
 
+## 恢复边界补测 · 2026-10-27
+
+基线为目录修复合并提交 [`a5253a1ae09bc5d6936d1415b864a23ddd15423e`](https://github.com/ag7kill1/CraftBrigde/commit/a5253a1ae09bc5d6936d1415b864a23ddd15423e)。[Windows CI #3](https://github.com/ag7kill1/CraftBrigde/actions/runs/40190394209) 验证该基线通过 68 项核心测试与 5 项界面测试；本轮补测结果来自本地 Windows 构建，不代表新提交的远程 CI。
+
+本轮在该基线上执行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test`，并为跨卷测试指定第二卷的独立临时目录：**73 项核心测试 + 5 项界面测试通过，0 失败、0 跳过**。C 盘放置游戏目录，D 盘放置运行目录；通过 Windows 卷标识确认是两个不同的卷。测试结束后专属夹具目录已清理，没有访问真实游戏数据。
+
+- 连续两次替换同一文件：两个任务目录分别保留原版和第一次导入的内容；恢复记录准确对应原位置及备份。
+- 跨卷替换成功和后续取消：运行文件旁创建同卷备份，记录映射正确；取消时两个卷均还原，成功回退消耗对应备份；收到的 ZIP 哈希不变。
+- 普通 `IOException`：确认 A 已新增、B 已替换，再在 C 提交复制时通过进度回调注入异常；A 撤回、B 还原，新建目录清理，既有空目录保留。
+- 世界暂存取消：确认已暂存 `level.dat` 并开始暂存区块，再取消；本次任务目录整体消失。临时清理断言现检查所有任务子项，包括世界文件和空目录。
+- 恢复记录：核对最后一条状态、原始原因及问题路径，覆盖成功、已回退和需手动恢复，包括目标被编辑、世界被编辑及备份缺失或篡改。
+- 发行文档：随包提供 `docs/` 和 `CONTRIBUTING.md`，构建测试检查 Markdown 本地文件链接；本轮发行目录 14 个本地链接目标全部可解析。检查器的缺失链接拒绝行为使用独立夹具验证。
+
+跨卷测试需显式设置已有且可写的第二卷目录，例如先创建专用 `D:\CraftBridge-TestParent`，然后运行：
+
+```powershell
+$env:CRAFTBRIDGE_TEST_SECONDARY_ROOT = 'D:\CraftBridge-TestParent'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test
+Remove-Item Env:\CRAFTBRIDGE_TEST_SECONDARY_ROOT
+```
+
+测试只在指定父目录中新建随机 `cross-volume-<GUID>` 子目录，并清理自己的子目录；指定目录与游戏夹具所在卷相同、卷无法确认或不可写时会失败。未设置此变量时，两个跨卷用例明确标为 **SKIP**，计入 `build/test-results.json` 的 `skipped`，不算通过；普通构建测试为 71 项核心通过、2 项跳过，加 5 项界面通过。默认 CI 不承诺第二卷可用。
+
+本轮未修改迁移算法。尚未验证真实 Minecraft 启动、联机、大规模数据吞吐、网络共享及断电/强制结束后的恢复；进度回调注入的异常不等同于模拟磁盘硬件故障。断电或强制结束后的自动恢复尚未实现。
+
 ## CraftBridge v0.2.0 · 2026-10-25
 
 Windows PowerShell 构建成功，**68 项核心测试 + 5 项界面状态测试全部通过**。新增回归验证 CraftBridge 的导出标识、旧 Blockporter 包读取，以及新旧工具工作目录的排除保护。

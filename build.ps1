@@ -56,9 +56,14 @@ try {
     Copy-Item -LiteralPath 'src\App.config' -Destination 'dist\CraftBridge.exe.config' -Force
     Copy-Item -LiteralPath 'LICENSE' -Destination 'dist\LICENSE' -Force
     Copy-Item -LiteralPath 'README.md' -Destination 'dist\使用说明.md' -Force
+    Copy-Item -LiteralPath 'README.md' -Destination 'dist\README.md' -Force
+    Copy-Item -LiteralPath 'CONTRIBUTING.md' -Destination 'dist\CONTRIBUTING.md' -Force
+    New-Item -ItemType Directory -Path 'dist\docs' -Force | Out-Null
+    Copy-Item -Path 'docs\*.md' -Destination 'dist\docs' -Force
     Copy-Item -LiteralPath 'docs\FORMAT.md' -Destination 'dist\迁移包格式.md' -Force
     Write-Output '已生成 dist\CraftBridge.exe'
     if ($Test) {
+        & (Join-Path $projectRoot 'scripts\Test-ReleaseLinks.ps1') -Root (Join-Path $projectRoot 'dist')
         $coreSources = @('src\Models.cs','src\FileSafety.cs','src\Discovery.cs','src\RuntimeCollector.cs','src\PackageEngine.cs')
         $testSources = @(Get-ChildItem -LiteralPath 'tests' -Filter '*.cs' | Where-Object { $_.Name -ne 'UiTests.cs' } | ForEach-Object { $_.FullName })
         & $compiler /nologo /codepage:65001 /optimize+ /target:exe '/out:build\CraftBridge.Tests.exe' $references $coreSources $testSources
